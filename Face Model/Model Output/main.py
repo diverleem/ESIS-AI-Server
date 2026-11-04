@@ -13,11 +13,14 @@ Features:
     * Detection: MTCNN (primary) / YuNet (fast ONNX) / Haar Cascade (fallback)
     * Feature Extraction: FaceNet (ONNX Runtime with GPU CUDA acceleration)
     * Matching: L2-Normalized Euclidean Distance against data_wajah_facenet_mtcnn.npz
-- Built-in Web Streaming Server (HTTP MJPEG):
+- Built-in Web Streaming Server (HTTP MJPEG & Snapshot API):
     * Modern dark dashboard accessible via browser or RunPod HTTP proxy port (8000)
+    * Flush & X-Accel-Buffering optimized for Nginx/RunPod proxy (zero-stall streaming)
     * Individual camera feeds (/video_feed/1, /video_feed/2)
     * Combined mosaic view (/video_feed/mosaic)
+    * Snapshot fallback API (/snapshot/1, /snapshot/2, /snapshot/mosaic)
     * Live status JSON API (/api/status)
+- Desktop GUI support via OpenCV window (--display)
 - Threaded non-blocking capture with auto-reconnection & mock fallback
 ================================================================================
 """
@@ -98,7 +101,6 @@ def normalize_camera_source(url: str, protocol: str = "auto") -> Tuple[str, bool
             u = u.replace("webrtc://", "https://")
         clean = u.rstrip("/")
         if not clean.endswith("/whep"):
-            # Jika user memberikan URL HLS atau path biasa, ubah ke /whep
             clean = clean.replace("/index.m3u8", "").rstrip("/")
             clean = f"{clean}/whep"
         return clean, True
@@ -116,12 +118,10 @@ def normalize_camera_source(url: str, protocol: str = "auto") -> Tuple[str, bool
             return u, True
         if ".m3u8" in u:
             return u, False
-        # Default untuk stream.ucim.my.id adalah WebRTC WHEP
         if "stream.ucim.my.id" in u:
             clean = u.rstrip("/").replace("/index.m3u8", "")
             return f"{clean}/whep", True
         else:
-            # Fallback untuk link lain (misal pinggy) ke HLS
             clean = u.rstrip("/")
             return f"{clean}/index.m3u8", False
 
@@ -145,7 +145,6 @@ class FaceDetector:
         self._init_backend()
 
     def _init_backend(self):
-        # 1. Coba MTCNN jika mode auto atau mtcnn
         if self.mode in ("auto", "mtcnn"):
             try:
                 from mtcnn import MTCNN
@@ -159,7 +158,6 @@ class FaceDetector:
                 if self.mode == "mtcnn":
                     print(f" [FaceDetector] MTCNN tidak tersedia ({e}), fallback ke alternatif.")
 
-        # 2. Coba YuNet ONNX jika mode auto atau yunet
         if self.mode in ("auto", "yunet"):
             yunet_file = os.path.join(SCRIPT_DIR, "face_detection_yunet_2023mar.onnx")
             if os.path.exists(yunet_file) and hasattr(cv2, "FaceDetectorYN"):
@@ -181,17 +179,12 @@ class FaceDetector:
                 except Exception:
                     pass
 
-        # 3. Fallback utama: OpenCV Haar Cascade
         cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         self.detector = cv2.CascadeClassifier(cascade_path)
         self.active_backend = "HaarCascade"
         print(" [FaceDetector] Backend aktif: OpenCV Haar Cascade (Fast Built-in)")
 
     def detect_faces(self, frame_bgr: np.ndarray, margin_percent: float = 0.10) -> List[Tuple[Tuple[int, int, int, int], np.ndarray, float]]:
-        """
-        Mendeteksi wajah pada frame BGR.
-        Mengembalikan daftar tuple: [((x, y, w, h), face_160_rgb, confidence), ...]
-        """
         results = []
         h, w = frame_bgr.shape[:2]
 
@@ -286,8 +279,8 @@ class FaceRecognitionEngine:
             raise FileNotFoundError(f"File database embedding NPZ tidak ditemukan di: {self.npz_database_path}")
 
         data = np.load(self.npz_database_path)
-        self.db_embeddings = data["x"] # Shape: (N, 512)
-        self.db_labels = data["y"]     # Shape: (N,)
+        self.db_embeddings = data["x"]
+        self.db_labels = data["y"]
         unique_classes = len(np.unique(self.db_labels))
         print(f" [FaceRecognition] Basis data wajah dimuat: {self.db_embeddings.shape[0]} foto dari {unique_classes} identitas.")
 
@@ -310,27 +303,16 @@ class FaceRecognitionEngine:
         print(f" [FaceRecognition] Model ONNX FaceNet dimuat dengan provider: {self.active_provider}")
 
     def extract_embedding(self, face_160_rgb: np.ndarray) -> np.ndarray:
-        """
-        Menghasilkan 512D L2-normalized embedding dari potongan wajah 160x160 RGB.
-        Formula standarisasi FaceNet: (pixel - 127.5) / 127.5
-        """
         norm_face = (face_160_rgb.astype(np.float32) - 127.5) / 127.5
-        inp = np.expand_dims(norm_face, axis=0) # [1, 160, 160, 3]
-
-        out = self.session.run(None, {"input": inp})[0][0] # 512 features
-
+        inp = np.expand_dims(norm_face, axis=0)
+        out = self.session.run(None, {"input": inp})[0][0]
         norm = np.linalg.norm(out)
         if norm > 0:
             out = out / norm
         return out
 
     def recognize(self, face_160_rgb: np.ndarray) -> Tuple[str, float, float]:
-        """
-        Mencocokkan embedding wajah dengan basis data NPZ.
-        Mengembalikan: (nama_prediksi, jarak_euclidean, similarity_percent)
-        """
         emb = self.extract_embedding(face_160_rgb)
-
         distances = np.linalg.norm(emb - self.db_embeddings, axis=1)
         best_idx = int(np.argmin(distances))
         min_dist = float(distances[best_idx])
@@ -362,20 +344,16 @@ class ThreadedCamera:
         self.source, self.is_webrtc = normalize_camera_source(source, protocol)
 
         self.cap: Optional[cv2.VideoCapture] = None
-        self.latest_frame: Optional[np.ndarray] = None
-        self.is_running = False
         self.is_connected = False
         self.fps = 0.0
+        self.latest_frame: Optional[np.ndarray] = self._generate_mock_frame()
+        self.is_running = False
 
         self.thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
 
     def start(self):
         self.is_running = True
-        # Inisialisasi frame standby agar stream tidak kosong saat awal start
-        with self.lock:
-            self.latest_frame = self._generate_mock_frame()
-
         if self.is_mock:
             self.thread = threading.Thread(target=self._mock_loop, daemon=True)
         elif self.is_webrtc:
@@ -397,12 +375,11 @@ class ThreadedCamera:
                 pass
 
     def _generate_mock_frame(self) -> np.ndarray:
-        """Membuat frame simulasi CCTV / standby jika stream belum terhubung"""
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        frame[:] = (30, 30, 35)
+        frame[:] = (25, 28, 35)
 
-        cv2.line(frame, (0, 240), (640, 240), (45, 45, 55), 1)
-        cv2.line(frame, (320, 0), (320, 480), (45, 45, 55), 1)
+        cv2.line(frame, (0, 240), (640, 240), (45, 48, 58), 1)
+        cv2.line(frame, (320, 0), (320, 480), (45, 48, 58), 1)
 
         t_now = time.strftime("%Y-%m-%d %H:%M:%S")
         if self.is_mock:
@@ -422,9 +399,9 @@ class ThreadedCamera:
             src_str = src_str[:42] + "..."
         cv2.putText(frame, f"Source: {src_str}", (25, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1)
 
-        cv2.rectangle(frame, (100, 200), (540, 280), (20, 20, 25), -1)
-        cv2.rectangle(frame, (100, 200), (540, 280), box_color, 2)
-        cv2.putText(frame, status_txt, (120, 248), cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
+        cv2.rectangle(frame, (90, 200), (550, 280), (18, 20, 26), -1)
+        cv2.rectangle(frame, (90, 200), (550, 280), box_color, 2)
+        cv2.putText(frame, status_txt, (110, 248), cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
 
         pulse_r = int(10 + 6 * np.sin(time.time() * 4))
         dot_color = (0, 255, 0) if self.is_connected else (0, 0, 255)
@@ -508,7 +485,6 @@ class ThreadedCamera:
         answer = RTCSessionDescription(sdp=answer_sdp, type="answer")
         await pc.setRemoteDescription(answer)
 
-        # Tunggu hingga track berakhir atau sinyal stop
         await track_ended.wait()
 
         self.is_connected = False
@@ -659,7 +635,10 @@ class PipelineManager:
         self.detector = detector
         self.recognizer = recognizer
 
-        self.annotated_frames: Dict[str, np.ndarray] = {}
+        # Inisialisasi frame awal dengan mock frame agar tidak kosong
+        self.annotated_frames: Dict[str, np.ndarray] = {
+            cam_key: cam.get_frame() for cam_key, cam in cameras.items()
+        }
         self.detections_history: List[Dict] = []
         self.camera_stats: Dict[str, Dict] = {}
         self.lock = threading.Lock()
@@ -675,7 +654,6 @@ class PipelineManager:
         out = frame.copy()
         h, w = out.shape[:2]
 
-        # 1. Gambar Bounding Box Wajah
         for d in detections:
             x, y, bw, bh = d["box"]
             name = d["name"]
@@ -683,13 +661,12 @@ class PipelineManager:
             dist = d["distance"]
 
             if name != "Unknown":
-                color = (46, 204, 113) # Hijau zamrud (Match)
+                color = (46, 204, 113)
                 tag_text = f"{name} ({sim:.1f}%)"
             else:
-                color = (41, 128, 250) # Oranye/Merah (Unknown)
+                color = (41, 128, 250)
                 tag_text = f"Unknown (d:{dist:.2f})"
 
-            # Bounding box dengan sudut elegan
             cv2.rectangle(out, (x, y), (x + bw, y + bh), color, 2)
             corner_len = min(20, int(bw * 0.25))
             cv2.line(out, (x, y), (x + corner_len, y), color, 4)
@@ -701,14 +678,12 @@ class PipelineManager:
             cv2.line(out, (x + bw, y + bh), (x + bw - corner_len, y + bh), color, 4)
             cv2.line(out, (x + bw, y + bh), (x + bw, y + bh - corner_len), color, 4)
 
-            # Banner Label Nama
             (tw, th), _ = cv2.getTextSize(tag_text, cv2.FONT_HERSHEY_DUPLEX, 0.55, 1)
             label_y1 = max(0, y - th - 12)
             label_y2 = y
             cv2.rectangle(out, (x, label_y1), (x + tw + 16, label_y2), color, -1)
             cv2.putText(out, tag_text, (x + 8, label_y2 - 5), cv2.FONT_HERSHEY_DUPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # 2. Top Header HUD
         hud_bg = np.zeros((40, w, 3), dtype=np.uint8)
         overlay = out[0:40, 0:w].copy()
         cv2.addWeighted(hud_bg, 0.65, overlay, 0.35, 0, out[0:40, 0:w])
@@ -730,12 +705,10 @@ class PipelineManager:
                     continue
 
                 t0 = time.time()
-                # 1. Deteksi Wajah
                 raw_faces = self.detector.detect_faces(frame)
 
                 detections = []
                 for (bbox, face_crop, conf) in raw_faces:
-                    # 2. Pengenalan Wajah dengan FaceNet ONNX
                     name, dist, sim = self.recognizer.recognize(face_crop)
                     det_item = {
                         "box": bbox,
@@ -752,7 +725,6 @@ class PipelineManager:
 
                 t_inf = (time.time() - t0) * 1000.0
 
-                # 3. Anotasi Frame
                 annotated = self._draw_annotation(frame, detections, cam.name, t_inf)
 
                 with self.lock:
@@ -783,27 +755,32 @@ class PipelineManager:
 
     def get_annotated_frame(self, cam_key: str) -> Optional[np.ndarray]:
         with self.lock:
-            return self.annotated_frames.get(cam_key)
+            frame = self.annotated_frames.get(cam_key)
+            if frame is not None:
+                return frame
+        cam = self.cameras.get(cam_key)
+        return cam.get_frame() if cam else None
 
     def get_mosaic_frame(self) -> Optional[np.ndarray]:
-        """Menggabungkan video kedua kamera menjadi satu frame berdampingan"""
         with self.lock:
             f1 = self.annotated_frames.get("cam1")
             f2 = self.annotated_frames.get("cam2")
 
-        if f1 is None and f2 is None:
-            return None
+        if f1 is None:
+            f1 = self.cameras["cam1"].get_frame() if "cam1" in self.cameras else None
+        if f2 is None:
+            f2 = self.cameras["cam2"].get_frame() if "cam2" in self.cameras else None
 
         target_h, target_w = 360, 640
-        def resize_std(img):
+        def resize_std(img, label):
             if img is None:
                 blank = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-                cv2.putText(blank, "NO SIGNAL", (240, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
+                cv2.putText(blank, f"NO SIGNAL ({label})", (160, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (120, 120, 120), 2)
                 return blank
             return cv2.resize(img, (target_w, target_h))
 
-        s1 = resize_std(f1)
-        s2 = resize_std(f2)
+        s1 = resize_std(f1, "CAM 1")
+        s2 = resize_std(f2, "CAM 2")
         return np.hstack([s1, s2])
 
     def get_status_dict(self) -> Dict:
@@ -827,9 +804,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <title>E.S.I.S - Multi-Camera Face Recognition (RunPod Node)</title>
     <style>
         :root {
-            --bg-primary: #0f172a;
-            --bg-card: #1e293b;
-            --border-color: #334155;
+            --bg-primary: #0b0f19;
+            --bg-card: #151d30;
+            --border-color: #24304f;
             --accent-green: #10b981;
             --accent-blue: #3b82f6;
             --accent-cyan: #06b6d4;
@@ -838,43 +815,55 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         }
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
         body { background: var(--bg-primary); color: var(--text-main); min-height: 100vh; padding: 20px; }
-        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 16px; margin-bottom: 24px; }
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 16px; margin-bottom: 24px; flex-wrap: wrap; gap: 12px; }
         .logo-title h1 { font-size: 20px; font-weight: 700; color: #fff; letter-spacing: -0.5px; }
         .logo-title p { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
-        .badges-group { display: flex; gap: 8px; }
-        .badge { padding: 4px 10px; border-radius: 9999px; font-size: 12px; font-weight: 600; background: rgba(16, 185, 129, 0.15); color: var(--accent-green); border: 1px solid var(--accent-green); }
+        .badges-group { display: flex; gap: 8px; flex-wrap: wrap; }
+        .badge { padding: 5px 12px; border-radius: 9999px; font-size: 12px; font-weight: 600; background: rgba(16, 185, 129, 0.15); color: var(--accent-green); border: 1px solid var(--accent-green); }
         .badge-cyan { background: rgba(6, 182, 212, 0.15); color: var(--accent-cyan); border: 1px solid var(--accent-cyan); }
         
+        .view-controls { display: flex; gap: 10px; margin-bottom: 20px; }
+        .btn-view { background: var(--bg-card); border: 1px solid var(--border-color); color: var(--text-muted); padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+        .btn-view.active, .btn-view:hover { background: var(--accent-blue); color: #fff; border-color: var(--accent-blue); }
+
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
         .stat-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 16px; }
-        .stat-card .label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; }
+        .stat-card .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px; }
         .stat-card .val { font-size: 20px; font-weight: 700; color: #fff; margin-top: 6px; }
 
-        .video-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 20px; margin-bottom: 24px; }
-        .cam-box { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; overflow: hidden; }
-        .cam-header { padding: 12px 16px; background: rgba(15, 23, 42, 0.6); display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); }
+        .video-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 20px; margin-bottom: 24px; }
+        .video-grid.single { grid-template-columns: 1fr; }
+        .cam-box { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+        .cam-header { padding: 12px 16px; background: rgba(11, 15, 25, 0.7); display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); }
         .cam-header h3 { font-size: 14px; font-weight: 600; color: var(--text-main); }
-        .feed-wrapper { width: 100%; aspect-ratio: 16 / 9; background: #000; position: relative; }
-        .feed-wrapper img { width: 100%; height: 100%; object-fit: contain; }
+        .feed-wrapper { width: 100%; aspect-ratio: 16 / 9; background: #000; position: relative; overflow: hidden; }
+        .feed-wrapper img { width: 100%; height: 100%; object-fit: contain; display: block; }
         
         .log-section { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 20px; }
         .log-section h2 { font-size: 16px; font-weight: 600; margin-bottom: 12px; }
         .log-table { width: 100%; border-collapse: collapse; font-size: 13px; }
         .log-table th { text-align: left; padding: 10px; border-bottom: 1px solid var(--border-color); color: var(--text-muted); font-weight: 600; }
-        .log-table td { padding: 10px; border-bottom: 1px solid rgba(51, 65, 85, 0.4); }
+        .log-table td { padding: 10px; border-bottom: 1px solid rgba(36, 48, 79, 0.6); }
         .tag-match { color: var(--accent-green); font-weight: 600; }
     </style>
 </head>
 <body>
     <div class="header">
         <div class="logo-title">
-            <h1>E.S.I.S - Multi-Camera Face Recognition Node</h1>
+            <h1>E.S.I.S - Multi-Camera Face Recognition Live Dashboard</h1>
             <p>Laboratorium Sistem Digital & Laboratorium OS | WebRTC WHEP + FaceNet ONNX</p>
         </div>
         <div class="badges-group">
-            <span class="badge badge-cyan">WEBRTC LOW-LATENCY</span>
-            <span class="badge" id="ai-status">RUNPOD GPU ACTIVE</span>
+            <span class="badge badge-cyan">WEBRTC WHEP DIRECT</span>
+            <span class="badge" id="ai-status">RUNPOD GPU NODE ACTIVE</span>
         </div>
+    </div>
+
+    <div class="view-controls">
+        <button class="btn-view active" onclick="switchView('dual')">Dual Kamera (Grid)</button>
+        <button class="btn-view" onclick="switchView('mosaic')">Mosaic Split-Screen</button>
+        <button class="btn-view" onclick="switchView('cam1')">Lab Sisdig Saja</button>
+        <button class="btn-view" onclick="switchView('cam2')">Lab OS Saja</button>
     </div>
 
     <div class="stats-grid">
@@ -896,23 +885,32 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         </div>
     </div>
 
-    <div class="video-container">
-        <div class="cam-box">
+    <div class="video-grid" id="main-video-grid">
+        <div class="cam-box" id="box-cam1">
             <div class="cam-header">
                 <h3>Kamera 1: Lab Sistem Digital</h3>
                 <span class="badge">LIVE FEED</span>
             </div>
             <div class="feed-wrapper">
-                <img src="/video_feed/1" alt="Feed Lab Sisdig">
+                <img id="img-cam1" src="/video_feed/1" onerror="handleStreamFallback(this, '/snapshot/1')" alt="Feed Lab Sisdig">
             </div>
         </div>
-        <div class="cam-box">
+        <div class="cam-box" id="box-cam2">
             <div class="cam-header">
                 <h3>Kamera 2: Lab OS</h3>
                 <span class="badge">LIVE FEED</span>
             </div>
             <div class="feed-wrapper">
-                <img src="/video_feed/2" alt="Feed Lab OS">
+                <img id="img-cam2" src="/video_feed/2" onerror="handleStreamFallback(this, '/snapshot/2')" alt="Feed Lab OS">
+            </div>
+        </div>
+        <div class="cam-box" id="box-mosaic" style="display: none;">
+            <div class="cam-header">
+                <h3>Mosaic Multi-Camera Live</h3>
+                <span class="badge">MOSAIC VIEW</span>
+            </div>
+            <div class="feed-wrapper">
+                <img id="img-mosaic" src="/video_feed/mosaic" onerror="handleStreamFallback(this, '/snapshot/mosaic')" alt="Mosaic Feed">
             </div>
         </div>
     </div>
@@ -935,6 +933,46 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     </div>
 
     <script>
+        function switchView(mode) {
+            document.querySelectorAll('.btn-view').forEach(b => b.classList.remove('active'));
+            event.target.classList.add('active');
+
+            const grid = document.getElementById('main-video-grid');
+            const b1 = document.getElementById('box-cam1');
+            const b2 = document.getElementById('box-cam2');
+            const bm = document.getElementById('box-mosaic');
+
+            if (mode === 'dual') {
+                grid.className = 'video-grid';
+                b1.style.display = 'block';
+                b2.style.display = 'block';
+                bm.style.display = 'none';
+            } else if (mode === 'mosaic') {
+                grid.className = 'video-grid single';
+                b1.style.display = 'none';
+                b2.style.display = 'none';
+                bm.style.display = 'block';
+            } else if (mode === 'cam1') {
+                grid.className = 'video-grid single';
+                b1.style.display = 'block';
+                b2.style.display = 'none';
+                bm.style.display = 'none';
+            } else if (mode === 'cam2') {
+                grid.className = 'video-grid single';
+                b1.style.display = 'none';
+                b2.style.display = 'block';
+                bm.style.display = 'none';
+            }
+        }
+
+        // Fallback otomatis ke snapshot polling jika browser menahan stream multipart
+        function handleStreamFallback(imgElement, snapshotUrl) {
+            console.warn("MJPEG streaming buffering/interrupted. Activating snapshot polling for", snapshotUrl);
+            setInterval(() => {
+                imgElement.src = snapshotUrl + "?t=" + Date.now();
+            }, 80);
+        }
+
         async function fetchStatus() {
             try {
                 const res = await fetch('/api/status');
@@ -982,36 +1020,64 @@ def make_stream_handler(pipeline: PipelineManager):
             pass
 
         def do_GET(self):
-            if self.path in ("/", "/index.html"):
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+
+            if path in ("/", "/index.html"):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(HTML_DASHBOARD.encode("utf-8"))
                 return
 
-            if self.path == "/api/status":
+            if path == "/api/status":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 self.wfile.write(json.dumps(pipeline.get_status_dict()).encode("utf-8"))
                 return
 
+            # Snapshot Endpoint (Single JPEG image per request)
+            if path in ("/snapshot/1", "/snapshot/2", "/snapshot/mosaic"):
+                key = path.replace("/snapshot/", "")
+                if key == "mosaic":
+                    frame = pipeline.get_mosaic_frame()
+                else:
+                    frame = pipeline.get_annotated_frame(f"cam{key}")
+
+                if frame is not None:
+                    ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if ret:
+                        b_data = jpeg.tobytes()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("Content-Length", str(len(b_data)))
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                        self.end_headers()
+                        self.wfile.write(b_data)
+                        return
+
             # MJPEG Stream Endpoint
             target_feed = None
-            if self.path == "/video_feed/1":
+            if path == "/video_feed/1":
                 target_feed = "cam1"
-            elif self.path == "/video_feed/2":
+            elif path == "/video_feed/2":
                 target_feed = "cam2"
-            elif self.path == "/video_feed/mosaic":
+            elif path == "/video_feed/mosaic":
                 target_feed = "mosaic"
 
             if target_feed:
                 self.send_response(200)
                 self.send_header("Age", "0")
-                self.send_header("Cache-Control", "no-cache, private")
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate, no-transform")
                 self.send_header("Pragma", "no-cache")
-                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=FRAME")
+                self.send_header("Expires", "0")
+                self.send_header("X-Accel-Buffering", "no") # Penting untuk reverse proxy RunPod / Nginx
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                 self.end_headers()
 
                 try:
@@ -1025,14 +1091,17 @@ def make_stream_handler(pipeline: PipelineManager):
                             ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
                             if ret:
                                 b_data = jpeg.tobytes()
-                                self.wfile.write(b"--FRAME\r\n")
-                                self.send_header("Content-Type", "image/jpeg")
-                                self.send_header("Content-Length", str(len(b_data)))
-                                self.end_headers()
-                                self.wfile.write(b_data)
-                                self.wfile.write(b"\r\n")
+                                self.wfile.write(
+                                    b"--frame\r\n"
+                                    b"Content-Type: image/jpeg\r\n"
+                                    b"Content-Length: " + str(len(b_data)).encode("ascii") + b"\r\n\r\n" +
+                                    b_data + b"\r\n"
+                                )
+                                self.wfile.flush() # Kirim frame langsung tanpa buffering
 
                         time.sleep(0.035) # ~28 fps cap
+                except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+                    pass
                 except Exception:
                     pass
                 return
@@ -1060,11 +1129,10 @@ def main():
     parser.add_argument("--detector", type=str, default="auto", choices=["auto", "mtcnn", "yunet", "haar"], help="Pilihan backend face detector")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"], help="Pilihan komputasi FaceNet")
     parser.add_argument("--mock", action="store_true", help="Jalankan dalam mode simulasi CCTV tanpa stream jaringan")
-    parser.add_argument("--display", action="store_true", help="Buka jendela lokal OpenCV GUI")
+    parser.add_argument("--display", action="store_true", help="Buka jendela pop-up GUI monitor desktop lokal (cv2.imshow)")
 
     args = parser.parse_args()
 
-    # Jika --pinggy diberikan, override kamera ke endpoint HLS Pinggy
     if args.pinggy:
         p_base = args.pinggy.strip().rstrip("/")
         args.cam1 = f"{p_base}/ecam_lab_sistem_digital/index.m3u8"
@@ -1081,12 +1149,11 @@ def main():
     print(f"  * Mode Protokol   : {args.protocol}")
     print(f"  * HTTP Web Port   : {args.port}")
     print(f"  * Threshold Jarak : {args.threshold}")
+    print(f"  * Local Display   : {'AKTIF (Jendela Desktop)' if args.display else 'NONAKTIF (Streaming Web Port ' + str(args.port) + ')'}")
     print("=" * 75)
 
-    # 1. Inisialisasi Detektor Wajah
     detector = FaceDetector(mode=args.detector)
 
-    # 2. Inisialisasi Engine Pengenalan Wajah
     recognizer = FaceRecognitionEngine(
         model_path=args.model,
         npz_database_path=args.database,
@@ -1094,16 +1161,13 @@ def main():
         device=args.device
     )
 
-    # 3. Inisialisasi Kamera CCTV (WebRTC WHEP / OpenCV)
     cam1 = ThreadedCamera(name="Lab Sisdig", source=args.cam1, protocol=args.protocol, is_mock=args.mock).start()
     cam2 = ThreadedCamera(name="Lab OS", source=args.cam2, protocol=args.protocol, is_mock=args.mock).start()
 
     cameras = {"cam1": cam1, "cam2": cam2}
 
-    # 4. Inisialisasi Pipeline AI
     pipeline = PipelineManager(cameras=cameras, detector=detector, recognizer=recognizer).start()
 
-    # 5. Jalankan Web Streaming Server di Background
     handler = make_stream_handler(pipeline)
     server = ThreadedHTTPServer(("0.0.0.0", args.port), handler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1116,7 +1180,11 @@ def main():
     print(f"  -> Stream Mosaic (Split)  : http://localhost:{args.port}/video_feed/mosaic")
     print(f"  -> Endpoint API Status    : http://localhost:{args.port}/api/status")
     print("-" * 75)
-    print("Tekan [Ctrl + C] untuk menghentikan program.")
+    if args.display:
+        print("[INFO] Jendela monitor desktop lokal dibuka. Tekan 'q' pada jendela video untuk keluar.")
+    else:
+        print("[INFO] Untuk membuka di monitor lokal, jalankan dengan argumen: python main.py --display")
+        print("Tekan [Ctrl + C] di terminal untuk menghentikan program.")
     print("-" * 75)
 
     try:
@@ -1127,7 +1195,7 @@ def main():
                     cv2.imshow("E.S.I.S Face Recognition - Dual Camera Live", m_frame)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
-            time.sleep(0.1)
+            time.sleep(0.05)
     except KeyboardInterrupt:
         print("\n[WAIT] Menghentikan seluruh worker kamera & server...")
     finally:
