@@ -1,0 +1,7 @@
+# E.S.I.S Multi-Camera Face Recognition Requirements for RunPod & GPU Server
+numpy>=1.22.0
+opencv-python-headless>=4.7.0.72
+onnxruntime-gpu>=1.16.0
+pillow>=9.0.0
+mtcnn>=0.1.1
+tensorflow>=2.10.0
