@@ -57,11 +57,11 @@ DEFAULT_DATABASE_NPZ = os.path.join(SCRIPT_DIR, "data_wajah_facenet_mtcnn.npz")
 # Default RTSP URL dari Database ESIS (Main Stream 101 (HD 1080p) untuk akurasi pengenalan wajah optimal)
 DEFAULT_RTSP_CAM1 = os.environ.get(
     "RTSP_RISET_LT5",
-    "rtsp://admin:EYQMDK@172.20.32.50:554/Streaming/Channels/101"
+    "https://fdxuqgcmfo.a.pinggy.link/cam_lab_riset_lt5"
 )
 DEFAULT_RTSP_CAM2 = os.environ.get(
     "RTSP_SISDIG",
-    "rtsp://admin:JOHVAF@172.20.32.43:554/Streaming/Channels/101"
+    "https://fdxuqgcmfo.a.pinggy.link/cam_lab_sistem_digital"
 )
 
 DEFAULT_PORT = int(os.environ.get("PORT", "8000"))
