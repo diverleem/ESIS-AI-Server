@@ -1,102 +1,85 @@
-# Panduan Deployment 4-Camera Face Recognition Node ke RunPod (E.S.I.S)
+# Panduan E.S.I.S Smart Patrol Tour (Main Stream HD Face Recognition)
 
-Dokumen ini menjelaskan arsitektur dan langkah-langkah lengkap untuk melakukan uji coba dan deployment program **Face Recognition 4-Kamera** ([`main.py`](file:///D:/web/esis/AI%20Server/Face%20Model/Model%20Output/main.py)) ke cloud GPU **RunPod** menggunakan protokol **HLS (FFmpeg Native Decoding)** dan **WebRTC (WHEP)**.
-
----
-
-## Fitur Utama
-
-1. **Dukungan 4 Kamera Sekaligus**:
-   - **Kamera 1**: Lab Riset Lantai 5 (`ecam_lab_riset_lt_5` - Codec **H.265 / HEVC**)
-   - **Kamera 2**: Lab Sistem Digital (`ecam_lab_sistem_digital` - Codec **H.264 / AVC**)
-   - **Kamera 3**: Lab OS (`ecam_lab_os` - Codec **H.264 / AVC**)
-   - **Kamera 4**: Lab Programming (`ecam_lab_programming` - Codec **H.264 / AVC**)
-
-2. **Dukungan Penuh Codec H.265 & H.264 via HLS**:
-   - Ingestion video menggunakan backend OpenCV FFmpeg yang secara bawaan mendukung decoding video **H.265 (HEVC)** tanpa kendala lisensi WebRTC.
-   - Menggunakan tunnel HLS MediaMTX via Pinggy:
-     * `https://fdxuqgcmfo.a.pinggy.link/<ecam_path>/index.m3u8`
-
-3. **Mode Simulasi Mandiri (Mock Face Recognition)**:
-   - Dilengkapi flag `--mock` yang secara otomatis menanamkan foto volunteer mahasiswa nyata dengan animasi gerakan halus.
-   - Memungkinkan pengujian menyeluruh (face detection, face matching, bounding box nama, skor akurasi, dan logging riwayat) langsung di browser tanpa perlu menunggu orang lewat di depan CCTV.
-
-4. **Tampilan Dashboard & Mosaic 2x2 HD**:
-   - Grid 2x2 yang menampilkan ke-4 kamera secara bersamaan.
-   - Endpoint streaming MJPEG individual (`/video_feed/1`, `/2`, `/3`, `/4`) dan mosaic (`/video_feed/mosaic`).
-   - Snapshot API (`/snapshot/1`, `/2`, `/3`, `/4`, `/mosaic`) dan REST status JSON (`/api/status`).
+Program [`main.py`](file:///D:/web/esis/AI%20Server/Face%20Model/Model%20Output/main.py) mengimplementasikan fitur **Smart Patrol Tour (Patroli Bergilir 30 Detik)** menggunakan **Main Stream (1080p / 2K)** untuk memaksimalkan akurasi deteksi dan pengenalan wajah mahasiswa tanpa membebani bandwidth jaringan.
 
 ---
 
-## 1. Struktur Berkas Direktori Deployment
+## 1. Konsep & Arsitektur Sistem
 
-Semua berkas yang dibutuhkan berada di direktori `AI Server/Face Model/Model Output/`:
-
-| Nama File | Deskripsi |
-| :--- | :--- |
-| **`main.py`** | Script inferensi AI 4-kamera dengan HTTP streaming server (MJPEG & 2x2 Mosaic). |
-| **`facenet.onnx`** | Model ekstraksi embedding wajah 512 dimensi FaceNet (Inception-ResNet-v1). |
-| **`data_wajah_facenet_mtcnn.npz`** | Basis data vektor embedding wajah mahasiswa (397 foto dari 38 identitas). |
-| **`requirements.txt`** | Daftar dependency Python (OpenCV headless, ONNX Runtime GPU, MTCNN, TensorFlow, NumPy, aiortc, aiohttp, av). |
-| **`Dockerfile`** | Berkas kontainerisasi Docker untuk deployment custom image di RunPod. |
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                   SMART PATROL TOUR CONTROLLER                         │
+│                                                                        │
+│   [Lab Riset Lt 5] ──(30s)──> [Lab Sisdig] ──(30s)──> [Lab OS]...      │
+│     (2K QHD H.265)             (720p H.264)             (Main/Sub)     │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ 1 Stream HD Aktif (~3-4 Mbps)
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                ZERO-LATENCY BUFFER-DROP GRABBER                        │
+│   * Membuang frame antrian lama secara instan (selalu real-time)       │
+│   * Dual-Scale Inference: Deteksi cepat, crop pada resolusi penuh      │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│             WEB DASHBOARD & MJPEG STREAM (PORT 8000)                   │
+│   * Tampilan Live Feed Full HD dengan HUD CCTV & Countdown Timer       │
+│   * Tombol Kunci Kamera Manual vs Patroli Otomatis                     │
+│   * Pilihan interval patroli: 15s / 30s / 60s                          │
+│   * Tabel log riwayat deteksi mahasiswa real-time                      │
+└────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## 2. Cara Menjalankan Program
 
-### A. Menjalankan di Komputer Lokal (Laptop / PC)
+### A. Mode Simulasi Mandiri (`--mock`) — *Direkomendasikan untuk Uji Coba Cepat*
+Menjalankan simulasi patroli lab dengan foto volunteer mahasiswa nyata tanpa membutuhkan koneksi fisik CCTV:
+```bash
+cd "AI Server/Face Model/Model Output"
+python main.py --mock --port 8000
+```
+> [!TIP]
+> Setiap 30 detik (atau interval yang dipilih), sistem akan otomatis berpindah lab dan mengenali wajah volunteer mahasiswa di lab tersebut secara *real-time*.
 
-1. **Jalankan Mode 4 Kamera HLS (Default CCTV Live):**
-   ```bash
-   cd "AI Server/Face Model/Model Output"
-   python main.py --port 8000
-   ```
+### B. Mode CCTV Live (Main Stream HD)
+Membuka aliran video Mainstream CCTV asli dari lab PLT:
+```bash
+cd "AI Server/Face Model/Model Output"
+python main.py --port 8000
+```
 
-2. **Jalankan Mode Simulasi Penuh (Mock Test Tanpa CCTV):**
-   ```bash
-   python main.py --mock --port 8000
-   ```
-   *(Mode ini langsung memunculkan volunteer wajah di ke-4 kamera dan menampilkan kotak deteksi hijau beserta nama mahasiswa).*
-
-3. **Jalankan dengan Pop-up GUI Desktop Lokal:**
-   ```bash
-   python main.py --display --port 8000
-   ```
-
----
-
-### B. Menjalankan di Cloud GPU RunPod
-
-1. **Sewa Pod**:
-   - Pilih GPU hemat: **RTX 3070**, **RTX 3080**, atau **RTX 4000 Ada**.
-   - Template: **RunPod PyTorch 2.1**.
-   - Tambahkan port **`8000`** pada kolom HTTP Ports.
-2. **Upload Berkas**:
-   - Buka JupyterLab / Terminal di Pod `/workspace`.
-   - Upload berkas `main.py`, `facenet.onnx`, `data_wajah_facenet_mtcnn.npz`, dan `requirements.txt`.
-3. **Instal Dependency**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. **Jalankan Program**:
-   ```bash
-   python main.py --port 8000
-   ```
-5. **Buka di Browser**:
-   Klik tombol **Connect** di dashboard RunPod -> klik link port **8000**:
-   `https://<POD_ID>-8000.proxy.runpod.net/`
+*Argumen Tambahan (Opsional):*
+* Ubah durasi patroli: `python main.py --interval 45 --port 8000`
+* Tampilkan pop-up monitor desktop: `python main.py --display --port 8000`
 
 ---
 
-## 3. Daftar Endpoint Streaming HTTP MJPEG
+## 3. Fitur Interaktif di Web Dashboard (`http://localhost:8000/`)
 
-| Endpoint | Fungsi |
-| :--- | :--- |
-| **`/`** | Dashboard Web Lengkap (Grid 4 Kamera, Kontrol Tampilan, dan Riwayat Deteksi) |
-| **`/video_feed/1`** | Live Stream Kamera 1 (Lab Riset Lt 5) |
-| **`/video_feed/2`** | Live Stream Kamera 2 (Lab Sistem Digital) |
-| **`/video_feed/3`** | Live Stream Kamera 3 (Lab OS) |
-| **`/video_feed/4`** | Live Stream Kamera 4 (Lab Programming) |
-| **`/video_feed/mosaic`** | Live Stream 2x2 Grid Mosaic Gabungan 4 Kamera (1280x720) |
-| **`/snapshot/<id>`** | Ambil 1 frame gambar JPEG statis (`1`, `2`, `3`, `4`, `mosaic`) |
-| **`/api/status`** | Endpoint JSON status kamera, FPS, latensi inferensi, dan daftar nama terdeteksi |
+1. **Live Patrol Feed**:
+   - Menampilkan feed video resolusi tinggi dengan overlay HUD waktu, FPS, latensi, dan sisa waktu patroli (*countdown*).
+2. **Kontrol Patroli Otomatis**:
+   - Tombol **"🔄 Mulai Patroli Otomatis"**: Berputar antar-lab setiap 30 detik.
+   - Pilihan Durasi: **15 Detik**, **30 Detik**, atau **60 Detik**.
+3. **Kunci Kamera Manual (*Manual Lock*)**:
+   - Klik salah satu tombol lab: **Lab Riset Lantai 5**, **Lab Sisdig**, **Lab OS**, atau **Lab Programming**.
+   - Sistem akan berhenti berputar dan mengunci pengawasan pada lab tersebut secara permanen hingga tombol patroli otomatis ditekan kembali.
+4. **Tabel Riwayat Deteksi Mahasiswa**:
+   - Mencatat mahasiswa yang teridentifikasi di setiap lab secara berurutan lengkap dengan persentase kemiripan (*similarity*).
+
+---
+
+## 4. Daftar Endpoint API
+
+| Endpoint | Metode | Fungsi |
+| :--- | :---: | :--- |
+| **`/`** | GET | Dashboard Pengawasan SOC E.S.I.S Lengkap |
+| **`/video_feed/live`** | GET | MJPEG Live Stream Kamera Patroli Aktif |
+| **`/snapshot/live`** | GET | Snapshot Frame Tunggal JPEG Kamera Aktif |
+| **`/api/status`** | GET | JSON Status Kamera Aktif, Sisa Waktu, FPS, & Riwayat Deteksi |
+| **`/api/patrol/auto`** | POST | Mengaktifkan Mode Patroli Otomatis |
+| **`/api/patrol/lock?id=<1-4>`** | POST | Mengunci Pengawasan ke Kamera Lab Tertentu |
+| **`/api/patrol/interval?sec=<detik>`** | POST | Mengubah Durasi Patroli per Lab |
